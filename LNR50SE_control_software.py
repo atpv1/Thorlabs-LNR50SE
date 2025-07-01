@@ -26,9 +26,10 @@ def init_stage(serial, channel):
 
     time.sleep(2)
 
-def home(serial, channel):
-    print(f'Homing Device {serial}')
-    bsm.SBC_Home(serial, channel)
+def home():
+    print('Homing Devices')
+    bsm.SBC_Home(serial_x, channel_x)
+    bsm.SBC_Home(serial_y, channel_y)
 
 #hid
 device = hid.device()
@@ -36,16 +37,16 @@ device.open(0x1313, 0x2005)
 
 #constants
 serial_x = c_char_p(bytes("70268564", "utf-8"))
-serial_y = None
+serial_y = c_char_p(bytes("70268564", "utf-8"))
 
-channel_x = 1
-channel_y = None
+channel_x = 2
+channel_y = 1
 
-default_data = [255, 1, 255, 1, 255, 1, 0, 0]
+default_data = [255, 1, 255, 1, 255, 1, 0, 1]
 FORWARD = bsm.MOT_Forwards
 REVERSE = bsm.MOT_Reverse
 ACCEL = 800000
-VEL_SCALE = 500000
+VEL_SCALE = 250000
 CENTER = 511
 BUFFER = 0
 MAX_VELO = 30000000
@@ -53,6 +54,7 @@ speed_change = 20
 
 #init stage
 init_stage(serial_x, channel_x)
+init_stage(serial_y, channel_y)
 
 
 #artifical polling
@@ -67,31 +69,28 @@ def cont_read_data(dev):
             data = default_data
         with data_lock:
             last_data = data
-
-def read_data():
-    data = device.read(8)
-    if not data:
-        data = default_data
-    return data
+        
 
 #start thread
 threading.Thread(target=cont_read_data, args=(device,), daemon=True).start()
 
 # ===STAGE CONTROLS===
 
-def get_delta():
+def get_delta(channel):
     with data_lock:
         data = last_data.copy()
-    pos = data[0] + data[1] * 256
-    return pos - CENTER
+    if channel == channel_x:
+        return (data[0] + data[1] * 256) - CENTER
+    else:
+        return (data[2] + data[3] * 256) - CENTER
 
 def stage_on(serial, channel):
     prev_direction = None
     prev_velocity = 0
 
     while not exit_event.is_set():
-        delta = get_delta()
-        if x_button == 1 or y_button == 1:
+        delta = get_delta(channel)
+        if (channel == channel_x and x_button == 1) or (channel == channel_y and y_button == 1):
             delta = 0
 
         if abs(delta) <= BUFFER:
@@ -106,9 +105,8 @@ def stage_on(serial, channel):
         velocity = int(min(VEL_SCALE * abs(delta), MAX_VELO))
 
         # Only update direction or velocity if it changed significantly
-        if direction != prev_direction or abs(velocity - prev_velocity) > 100000:
+        if direction != prev_direction or abs(velocity - prev_velocity) > 3000000:
             bsm.SBC_StopImmediate(serial, channel)
-            time.sleep(0.01)
             bsm.SBC_SetVelParams(serial, channel, ACCEL, velocity)
             bsm.SBC_MoveAtVelocity(serial, channel, direction)
             prev_direction = direction
@@ -121,6 +119,7 @@ y_button = 0
 lights = [255, 96, 255]
 
 
+
 def button_controls(): 
     global x_button
     global y_button
@@ -129,10 +128,13 @@ def button_controls():
 
     is_button_on = True
 
+    prev_data = default_data
+
     while is_button_on:  
-        data = read_data()  
+        with data_lock:
+            data = last_data.copy()
         #turn off/on lights
-        if data[6] == 1:
+        if data[6] == 1 and prev_data[6] != 1:
             if x_button == 0:
                 lights[1] = 0
                 device.write(lights)
@@ -141,7 +143,7 @@ def button_controls():
                 lights[1] = 255
                 device.write(lights)
                 x_button = 0
-        elif data[6] == 2:
+        elif data[6] == 2 and prev_data[6] != 2:
             if y_button == 0:
                 lights[2] = 0
                 device.write(lights)
@@ -150,6 +152,7 @@ def button_controls():
                 lights[2] = 255 
                 device.write(lights)
                 y_button = 0
+        prev_data = data
 
 def controller_on():
     exit_event.clear()
@@ -159,10 +162,12 @@ def controller_on():
 
     threading.Thread(target = button_controls, daemon=True).start()
     threading.Thread(target = stage_on, args=(serial_x, channel_x), daemon=True).start()
+    threading.Thread(target = stage_on, args=(serial_y, channel_y), daemon=True).start()
 
 def stop():
     print('Stopping')
-    bsm.SBC_StopProfiled(serial_x, channel_x) # no y fo now
+    bsm.SBC_StopProfiled(serial_x, channel_x)
+    bsm.SBC_StopProfiled(serial_y, channel_y)
 
 def stop_controller():
     global is_button_on
@@ -173,6 +178,10 @@ def stop_controller():
     time.sleep(0.2)
     bsm.SBC_ClearMessageQueue(serial_x, channel_x)
 
+    bsm.SBC_StopImmediate(serial_y, channel_y)
+    time.sleep(0.2)
+    bsm.SBC_ClearMessageQueue(serial_y, channel_y)
+
     is_button_on = False
     status_canvas.itemconfig(status_circle, fill='red')
     device.write([0, 0, 0])
@@ -181,15 +190,20 @@ def stop_controller():
 # === GUI Back End ===
 def read_position():
     device_x = bsm.SBC_GetPositionCounter(serial_x, channel_x) / encoder_scale
-    #no y for now 
-    return device_x
+    device_y = bsm.SBC_GetPositionCounter(serial_y, channel_y) / encoder_scale
+    return device_x, device_y
 
-def move(x):
-    print(f'Moving: {x}')
-    speed = (int(100000 * encoder_scale))
-    bsm.SBC_SetVelParams(serial_x, channel_x, ACCEL, speed)
+def move(x, y):
+    print(f'Moving: {x}, {y}')
+    default_speed = (int(100000 * encoder_scale))
+    bsm.SBC_SetVelParams(serial_x, channel_x, ACCEL, default_speed)
+    bsm.SBC_SetVelParams(serial_y, channel_y, ACCEL, default_speed)
+
     x_position = int(x * encoder_scale)
-    bsm.SBC_MoveToPosition(serial_x, channel_x, x_position) #no y fo now
+    bsm.SBC_MoveToPosition(serial_x, channel_x, x_position)
+
+    y_position = int(y * encoder_scale)
+    bsm.SBC_MoveToPosition(serial_y, channel_y, y_position)
 
 
 def restart():
@@ -200,10 +214,12 @@ def restart():
     bsm.SBC_StopPolling(serial_x, channel_x)
     bsm.SBC_Close(serial_x, channel_x)
     bsm.SBC_ClearMessageQueue(serial_x, channel_x)
-    #channel_y.StopPolling()
-    #channel_y.Disconnect()
+    bsm.SBC_StopPolling(serial_y, channel_y)
+    bsm.SBC_Close(serial_y, channel_y)
+    bsm.SBC_ClearMessageQueue(serial_y, channel_y)
+
     init_stage(serial_x, channel_x)
-    #init_stage(serial_y, channel_y)
+    init_stage(serial_y, channel_y)
     
     print('Devices Restarted')
 
@@ -252,9 +268,9 @@ y_position_label.grid(row=1, column=0, sticky="w")
 
 def update_position_labels():
     try:
-        x = read_position()
+        x, y = read_position()
         x_position.set(f"X: {x:.3f} microns")
-        # y_position.set(f"Y: {y:.3f} microns")
+        y_position.set(f"Y: {y:.3f} microns")
     except Exception as e:
         print("Failed to read position:", e)
     root.after(100, update_position_labels)
@@ -281,10 +297,10 @@ def update_dropdown():
         menu.add_command(label=name, command=lambda v=name: selected_position.set(v))
 
 def save_position_name():
-    x_pos = read_position() #no y pos for now
-    name = f'{name_entry.get()}: {x_pos: .3f} X'
+    x_pos, y_pos = read_position()
+    name = f'{name_entry.get()}: {x_pos: .3f} X, {y_pos: .3f} Y'
     if name:
-        saved_positions[name] = (x_pos)
+        saved_positions[name] = (x_pos, y_pos)
         print(f"Saved '{name}': {saved_positions[name]}")
         update_dropdown()
     else:
@@ -294,9 +310,9 @@ def go_to_position():
     name = selected_position.get()
     if name in saved_positions:
         pos = saved_positions[name]
-        x = pos
+        x, y = pos
         print(f"Going to position '{name}'")
-        move(x) #no y for now
+        move(x, y)
     else:
         print("No valid position selected.")
 
@@ -328,7 +344,7 @@ status_circle = status_canvas.create_oval(2, 2, 14, 14, fill = 'red')
 status_canvas.pack(side="left", padx=(6, 0))
 
 home_button = tk.Button(root, text="Home", font=FONT_BODY,
-                        command= lambda: home(serial_x, channel_x), width=10)
+                        command= lambda: home(), width=10)
 home_button.grid(row=3, column=0, rowspan=2, sticky="ns", padx=(0, 5), pady=0)
 
 
@@ -344,7 +360,7 @@ move_entry_x.grid(row=1, column = 0, sticky="w", padx = (0, 10), pady=(5, 5))
 move_entry_y = tk.Entry(move_entry_frame, width = 7, font=("Segoe UI", 11))
 move_entry_y.grid(row=1, column = 1, sticky="w", pady=(5, 5))
 
-move_button = tk.Button(root, text = 'Move', font = FONT_BODY, command = lambda: move(float(move_entry_x.get())), width = 10)
+move_button = tk.Button(root, text = 'Move', font = FONT_BODY, command = lambda: move(float(move_entry_x.get()), float(move_entry_y.get())), width = 10)
 move_button.grid(row= 5, column = 2, sticky = 'w', padx = (5, 0), pady = (0, 5))
 
 master_stop_button = tk.Button(root, text = 'STOP', font = FONT_BODY, command = lambda: stop(), width = 10)
@@ -362,8 +378,13 @@ def on_close():
     bsm.SBC_StopProfiled(serial_x, channel_x)
     time.sleep(0.2)
     bsm.SBC_ClearMessageQueue(serial_x, channel_x)
-    #channel_y.StopPolling()
-    #channel_y.Disconnect()
+    
+    bsm.SBC_StopPolling(serial_y, channel_y)
+    bsm.SBC_Close(serial_y, channel_y)
+    bsm.SBC_StopProfiled(serial_y, channel_y)
+    time.sleep(0.2)
+    bsm.SBC_ClearMessageQueue(serial_y, channel_y)
+    
     device.write([0, 0, 0])
     root.destroy()
 
